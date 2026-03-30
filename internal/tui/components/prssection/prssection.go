@@ -5,12 +5,12 @@ import (
 	"slices"
 	"time"
 
-	"charm.land/bubbles/v2/key"
-	tea "charm.land/bubbletea/v2"
-	"charm.land/log/v2"
+	"github.com/charmbracelet/bubbles/key"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/dlvhdr/gh-dash/v4/internal/config"
 	"github.com/dlvhdr/gh-dash/v4/internal/data"
+	"github.com/dlvhdr/gh-dash/v4/internal/provider"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/prrow"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/section"
 	"github.com/dlvhdr/gh-dash/v4/internal/tui/components/table"
@@ -62,15 +62,14 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 	case tea.KeyMsg:
 
 		if m.IsSearchFocused() {
-			switch msg.String() {
-			case "ctrl+c", "esc":
+			switch msg.Type {
+			case tea.KeyCtrlC, tea.KeyEsc:
 				m.SearchBar.SetValue(m.SearchValue)
 				blinkCmd := m.SetIsSearching(false)
 				return m, blinkCmd
 
-			case "enter":
+			case tea.KeyEnter:
 				m.SearchValue = m.SearchBar.Value()
-				m.SyncSmartFilterWithSearchValue()
 				m.SetIsSearching(false)
 				m.ResetRows()
 				return m, tea.Batch(m.FetchNextPageSectionRows()...)
@@ -80,18 +79,18 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 		}
 
 		if m.IsPromptConfirmationFocused() {
-			switch msg.String() {
-			case "ctrl+c", "esc":
+			switch msg.Type {
+			case tea.KeyCtrlC, tea.KeyEsc:
 				m.PromptConfirmationBox.Reset()
 				cmd = m.SetIsPromptConfirmationShown(false)
 				return m, cmd
 
-			case "enter":
+			case tea.KeyEnter:
 				input := m.PromptConfirmationBox.Value()
 				action := m.GetPromptConfirmationAction()
 				pr := m.GetCurrRow()
 				sid := tasks.SectionIdentifier{Id: m.Id, Type: SectionType}
-				if input == "" || input == "Y" || input == "y" {
+				if input == "Y" || input == "y" {
 					switch action {
 					case "close":
 						cmd = tasks.ClosePR(m.Ctx, sid, pr)
@@ -103,8 +102,6 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 						cmd = tasks.MergePR(m.Ctx, sid, pr)
 					case "update":
 						cmd = tasks.UpdatePR(m.Ctx, sid, pr)
-					case "approveWorkflows":
-						cmd = tasks.ApproveWorkflows(m.Ctx, sid, pr)
 					}
 				}
 
@@ -122,20 +119,9 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 			cmd = m.diff()
 
 		case key.Matches(msg, keys.PRKeys.ToggleSmartFiltering):
-			before := m.IsFilteredByCurrentRemote
-
-			// If we're filtering by the current repo - we want to remove it
-			// If there's no repo filter we want to add the current repo filter.
-			if m.HasCurrentRepoNameInConfiguredFilter() || !m.HasRepoNameInConfiguredFilter() {
-				m.IsFilteredByCurrentRemote = !before
+			if !m.HasRepoNameInConfiguredFilter() {
+				m.IsFilteredByCurrentRemote = !m.IsFilteredByCurrentRemote
 			}
-			log.Debug(
-				"toggled smart filtering",
-				"before",
-				before,
-				"after",
-				m.IsFilteredByCurrentRemote,
-			)
 			searchValue := m.GetSearchValue()
 			if m.SearchValue != searchValue {
 				m.SearchValue = searchValue
@@ -179,9 +165,6 @@ func (m *Model) Update(msg tea.Msg) (section.Section, tea.Cmd) {
 			if msg.RemovedAssignees != nil {
 				currPr.Primary.Assignees.Nodes = removeAssignees(
 					currPr.Primary.Assignees.Nodes, msg.RemovedAssignees.Nodes)
-			}
-			if msg.Labels != nil {
-				currPr.Primary.Labels.Nodes = msg.Labels.Nodes
 			}
 			if msg.ReadyForReview != nil && *msg.ReadyForReview {
 				currPr.Primary.IsDraft = false
@@ -269,7 +252,6 @@ func GetSectionColumns(
 	)
 	stateLayout := config.MergeColumnConfigs(dLayout.State, sLayout.State)
 	ciLayout := config.MergeColumnConfigs(dLayout.Ci, sLayout.Ci)
-	labelsLayout := config.MergeColumnConfigs(dLayout.Labels, sLayout.Labels)
 	linesLayout := config.MergeColumnConfigs(dLayout.Lines, sLayout.Lines)
 
 	if !ctx.Config.Theme.Ui.Table.Compact {
@@ -283,11 +265,6 @@ func GetSectionColumns(
 				Title:  "Title",
 				Grow:   utils.BoolPtr(true),
 				Hidden: titleLayout.Hidden,
-			},
-			{
-				Title:  constants.LabelsIcon,
-				Width:  labelsLayout.Width,
-				Hidden: labelsLayout.Hidden,
 			},
 			{
 				Title:  "Assignees",
@@ -353,11 +330,6 @@ func GetSectionColumns(
 			Title:  "Author",
 			Width:  authorLayout.Width,
 			Hidden: authorLayout.Hidden,
-		},
-		{
-			Title:  constants.LabelsIcon,
-			Width:  labelsLayout.Width,
-			Hidden: labelsLayout.Hidden,
 		},
 		{
 			Title:  "Assignees",
@@ -460,14 +432,19 @@ func (m *Model) FetchNextPageSectionRows() []tea.Cmd {
 	if m.PageInfo != nil {
 		startCursor = m.PageInfo.StartCursor
 	}
+	itemType := "PRs"
+	if provider.IsGitLab() {
+		itemType = "MRs"
+	}
 	taskId := fmt.Sprintf("fetching_prs_%d_%s", m.Id, startCursor)
 	isFirstFetch := m.LastFetchTaskId == ""
 	m.LastFetchTaskId = taskId
 	task := context.Task{
 		Id:        taskId,
-		StartText: fmt.Sprintf(`Fetching PRs for "%s"`, m.Config.Title),
+		StartText: fmt.Sprintf(`Fetching %s for "%s"`, itemType, m.Config.Title),
 		FinishedText: fmt.Sprintf(
-			`PRs for "%s" have been fetched`,
+			`%s for "%s" have been fetched`,
+			itemType,
 			m.Config.Title,
 		),
 		State: context.TaskStart,
@@ -583,10 +560,16 @@ func assigneesContains(assignees []data.Assignee, assignee data.Assignee) bool {
 }
 
 func (m Model) GetItemSingularForm() string {
+	if provider.IsGitLab() {
+		return "MR"
+	}
 	return "PR"
 }
 
 func (m Model) GetItemPluralForm() string {
+	if provider.IsGitLab() {
+		return "MRs"
+	}
 	return "PRs"
 }
 
